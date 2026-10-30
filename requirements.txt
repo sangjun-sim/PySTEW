@@ -1,0 +1,5 @@
+numpy
+scipy
+ase
+HamiltonIO==0.3.8
+TB2J==0.9.20
