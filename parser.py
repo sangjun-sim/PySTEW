@@ -137,5 +137,7 @@ def parse_args(argv=None, description=None):
         distance=settings["distance"],
         tolerance=settings["tolerance"],
     )
+    if 0.0 not in args.thetas or len(args.thetas) < 3:
+        parser.error("thetas must contain 0 and at least three angles")
     
     return args

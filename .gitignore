@@ -1,0 +1,7 @@
+**/.DS_Store
+__pycache__
+/examples/NiO/nscf/*.amn
+/examples/NiO/nscf/*.mmn
+/examples/NiO/nscf/*.eig
+/examples/NiO/nscf/*.chk
+/examples/NiO/nscf/*_wsvec.dat

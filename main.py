@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mix d/p Wannier functions, then print total J, charge and finite-difference dJ/dq.
+"""Mix d/p Wannier functions directly in k space, then print dJ/dq at theta=0.
 
 Usage:
   python main.py example.json
@@ -8,29 +8,32 @@ See example.json for configuration (theta in degrees, energies in eV).
 All fields are required, with no option defaults. Paths are relative to the JSON file.
 Lines beginning with // are comments.
 
-SRC contains UP/DOWN .win, _hr.dat and _centres.xyz files. Transformed models
-are written to OUT/theta=VALUE. The same U(k) is applied to both spins.
+SRC contains UP/DOWN .win, _hr.dat and _centres.xyz files. H_theta(k) is evaluated
+directly at the TB2J k points; no transformed Hamiltonian files are written.
+OUT is the TB2J output directory. The same U(k) is applied to both spins.
 The hopping convention c=H_reference[d,p]/norm is retained from mix_dp.py.
 Weights select H_up, H_down, or (H_up+H_down)/2 BEFORE normalization.
 
 q is the mean Wannier electron population of the two magnetic atoms, not an
-ionic charge. dJ/dq is Delta J / Delta q along the chosen mixing path, printed
-for adjacent sorted angles and for the full endpoint interval. No orbital J,
-C or S is calculated. Final WF order must follow the .win projections.
+ionic charge. dJ/dq is np.gradient(J, q, edge_order=2) along the chosen mixing
+path, using at least three angles including zero. Only dJ/dq at theta=0 is
+printed for each pair and for the mean J and q of the selected pairs.
+No orbital J, C or S is calculated. Final WF order must follow the .win projections.
 Both spins must use the same per-WF integer home-cell convention for mixing.
-Band preservation is checked on the input .win k mesh.
+No Hamiltonian k-to-R reconstruction or subsequent interpolation is performed.
 
 Requires NumPy, SciPy, ASE, HamiltonIO and TB2J (tested with TB2J 0.9.20).
 """
 
 from contextlib import redirect_stdout
-import os
-import shutil
+from pathlib import Path
 import sys
 
 import numpy as np
 from scipy.linalg import expm
+from HamiltonIO.wannier import WannierHam
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import parser
 
 
@@ -57,33 +60,6 @@ def build_generator(Hup, Hdn, R, centres, cell, d_indices, p_indices, bond, weig
             X[Rindex[tuple(-r)], p, d] += c
     
     return X
-
-
-def prepare_transform(k, R, deg, Hup, Hdn, X):
-    ph = np.exp(2j * np.pi * k @ R.T) / deg
-    phinv = np.exp(-2j * np.pi * k @ R.T) / len(k)
-    Xk = np.einsum("kr,rmn->kmn", ph, X, optimize=True)
-    Hk = tuple(np.einsum("kr,rmn->kmn", ph, H, optimize=True) for H in (Hup, Hdn))
-    
-    return ph, phinv, Hk, Xk
-
-
-def transform_prepared(prepared, theta):
-    ph, phinv, Hk, Xk = prepared
-    U = np.array([expm(np.deg2rad(theta) * x) for x in Xk])
-    output = []
-    
-    for spin, H in zip(("up", "down"), Hk):
-        rotated = U.conj().transpose(0, 2, 1) @ H @ U
-        HR = np.einsum("kr,kmn->rmn", phinv, rotated, optimize=True)
-        back = np.einsum("kr,rmn->kmn", ph, HR, optimize=True)
-        band_error = np.max(np.abs(np.linalg.eigvalsh(rotated) - np.linalg.eigvalsh(H)))
-        roundtrip_error = np.max(np.abs(back - rotated))
-        print(f"theta={theta:g} {spin}: max band change="
-              f"{band_error:.3e} eV; mesh round trip={roundtrip_error:.3e} eV", file=sys.stderr)
-        output.append(HR)
-    
-    return tuple(output)
 
 
 def shift_cells(data, shifts):
@@ -136,39 +112,67 @@ def total_exchange_class():
     return TotalExchangeCL2
 
 
-def calculate(seeds, atoms, basis, args):
-    from HamiltonIO.wannier import WannierHam
+def print_results(thetas, results, distance, tolerance):
+    index = thetas.index(0.0)
+    reference = results[index]
+    keys = sorted(reference, key=lambda key: (reference[key][0], key))
 
+    print("# theta=0; dJdq in meV/e, evaluated with np.gradient(J, q, edge_order=2)")
+    print("i j Rx Ry Rz distance dJdq")
+
+    for i, j, R in keys:
+        dist = reference[(i, j, R)][0]
+        J, q = np.array([result[(i, j, R)][1:] for result in results]).T
+        derivative = np.gradient(J, q, edge_order=2)[index]
+        print(i, j, *R, f"{dist:.6f}", f"{derivative:.9g}")
+
+    means = np.array([np.mean([result[key][1:] for key in keys], axis=0)
+                      for result in results])
+    derivative = np.gradient(means[:, 0], means[:, 1], edge_order=2)[index]
+    selection = f" within {distance} +/- {tolerance} Angstrom" if distance is not None else ""
+    print(f"# mean over {len(keys)} directed pairs{selection}")
+    print(f"# mean theta=0 dJdq={derivative:.9g}")
+
+
+class RotatedWannierHam(WannierHam):
+    def __init__(self, R, deg, H, X, positions, shifts, theta):
+        data = {tuple(r): h / g for r, g, h in zip(R, deg, H)}
+        super().__init__(nbasis=H.shape[-1], data=data, positions=positions)
+        self.rotation_R = np.asarray(R)
+        self.generator = X / np.asarray(deg)[:, None, None]
+        self.shifts = np.asarray(shifts)
+        self.theta = np.deg2rad(theta)
+
+    def gen_ham(self, k):
+        H = super().gen_ham(k)
+        phase = np.exp(self.R2kfactor * (self.rotation_R @ k))
+        Xk = np.einsum("r,rij->ij", phase, self.generator, optimize=True)
+        U = expm(self.theta * Xk)
+        rotated = U.conj().T @ H @ U
+
+        # Rotate in the original WF gauge, then shift each WF to its atom's cell.
+        cell_phase = np.exp(self.R2kfactor * (self.shifts @ k))
+
+        return cell_phase.conj()[:, None] * rotated * cell_phase[None, :]
+
+
+def calculate(models, atoms, basis, args):
     labels = parser.atom_labels(atoms)
-    atom_index = {label: i for i, label in enumerate(labels)}
-    positions = atoms.get_scaled_positions(wrap=False)[[atom_index[label.split("|")[0]] for label in basis]]
-    models = []
-
-    for seed in seeds:
-        centres = parser.read_centres(f"{seed}_centres.xyz", len(basis))
-        shifts = np.rint(atoms.cell.scaled_positions(centres) - positions).astype(int)
-        nw, R, deg, H = parser.read_hr(f"{seed}_hr.dat")
-        data = shift_cells({tuple(r): matrix / g for r, g, matrix in zip(R, deg, H)}, shifts)
-        model = WannierHam(nbasis=nw, data=data, positions=positions,
-                           R_degens=np.ones(len(data), dtype=int))
-        model.set_atoms(atoms)
-        models.append(model)
-
     exchange = total_exchange_class()(
-        tbmodels=tuple(models), 
-        atoms=atoms, 
+        tbmodels=tuple(models),
+        atoms=atoms,
         basis=basis,
-        magnetic_elements=args.elements, 
+        magnetic_elements=args.elements,
         efermi=args.efermi,
-        kmesh=args.kmesh, 
-        Rcut=args.rcut, 
+        kmesh=args.kmesh,
+        Rcut=args.rcut,
         smearing=args.smearing,
-        nz=args.nz, 
-        nproc=1, 
-        use_cache=False, 
+        nz=args.nz,
+        nproc=1,
+        use_cache=False,
         orb_decomposition=False,
+        output_path=str(args.out),
     )
-
     try:
         exchange.calculate_all()
         result = {}
@@ -179,115 +183,66 @@ def calculate(seeds, atoms, basis, args):
             R, i, j = key
             ia, ja = exchange.iatom(i), exchange.iatom(j)
             charge = 0.5 * (exchange.charges[ia] + exchange.charges[ja])
-            result[(labels[ia], labels[ja], tuple(R))] = (distance, float(value) * 1000.0, float(charge))
+            result[(labels[ia], labels[ja], tuple(R))] = (
+                distance, float(value) * 1000.0, float(charge)
+            )
         return result, exchange.kmesh
     finally:
         exchange.finalize()
 
 
-def print_results(thetas, results, distance, tolerance):
-    keys = set(results[0])
-    keys = sorted(keys, key=lambda key: (results[0][key][0], key))
-    print("# J in meV; q = mean Wannier electron population of the pair, in electrons")
-    print("theta i j Rx Ry Rz distance J q")
-
-    for theta, result in zip(thetas, results):
-        for i, j, R in keys:
-            dist, J, q = result[(i, j, R)]
-            print(str(theta), i, j, *R, f"{dist:.6f}", f"{J:.9g}", f"{q:.9g}")
-    
-    intervals = [("adjacent", i, i + 1) for i in range(len(thetas) - 1)]
-    if len(thetas) > 2:
-        intervals.append(("overall", 0, len(thetas) - 1))
-    
-    print("# dJdq = (J_to-J_from)/(q_to-q_from), in meV/e")
-    print("scope theta_from theta_to i j Rx Ry Rz distance dJdq")
-    
-    for scope, left, right in intervals:
-        for i, j, R in keys:
-            dist, jl, ql = results[left][(i, j, R)]
-            _, jr, qr = results[right][(i, j, R)]
-            dj, dq = jr - jl, qr - ql
-            derivative = dj / dq if dq else (float("inf") if dj else float("nan"))
-            print(scope, str(thetas[left]), str(thetas[right]), i, j, *R,
-                  f"{dist:.6f}", f"{derivative:.9g}")
-    
-    if distance is not None:
-        means = [np.mean([result[key][1:] for key in keys], axis=0) for result in results]
-        print(f"# mean over {len(keys)} directed pairs within {distance} +/- {tolerance} Angstrom")
-        for theta, (J, q) in zip(thetas, means):
-            print(f"# mean theta={theta} J={J:.9g} q={q:.9g}")
-        for scope, left, right in intervals:
-            jl, ql = means[left]
-            jr, qr = means[right]
-            dj, dq = jr - jl, qr - ql
-            derivative = dj / dq if dq else (float("inf") if dj else float("nan"))
-            print(f"# mean {scope} theta_from={thetas[left]} "
-                  f"theta_to={thetas[right]} "
-                  f"dJdq={derivative:.9g}")
-
-
 def main(argv=None):
     args = parser.parse_args(argv, description=__doc__)
-    prefixes, thetas = args.prefixes, args.thetas
-    reference, hamiltonians, spin_centres = None, [], []
-    
-    for prefix in prefixes:
+    hamiltonians, spin_centres = [], []
+    reference = None
+
+    for prefix in args.prefixes:
         seed = args.src / prefix
         k, atoms, basis = parser.read_win(f"{seed}.win")
         nw, R, deg, H = parser.read_hr(f"{seed}_hr.dat")
         spin_centres.append(parser.read_centres(f"{seed}_centres.xyz", nw))
         if reference is None:
-            reference = k, atoms, basis, R, deg
+            reference = atoms, basis, R, deg
         hamiltonians.append(H)
-    
-    k, atoms, basis, R, deg = reference
+
+    atoms, basis, R, deg = reference
     centres = spin_centres[0]
     images = np.array([[i, j, l] for i in (-1, 0, 1)
                        for j in (-1, 0, 1) for l in (-1, 0, 1)])
-    shifts = images @ atoms.cell
+    images_cart = images @ atoms.cell
     nearest = [min(range(len(atoms)), key=lambda i:
-                   np.linalg.norm(centre - atoms.positions[i] - shifts, axis=1).min())
+                   np.linalg.norm(centre - atoms.positions[i] - images_cart, axis=1).min())
                for centre in centres]
-    
     d_indices = [m for m, i in enumerate(nearest) if atoms[i].symbol == args.mag]
     p_indices = [m for m, i in enumerate(nearest) if atoms[i].symbol == args.lig]
-
-    # X transforms the Hamiltonians and one writes new .hr.dat files for each theta
     X = build_generator(*hamiltonians, R, centres, atoms.cell,
-                        d_indices, p_indices, args.bond, args.weight)
-    prepared = prepare_transform(k, R, deg, *hamiltonians, X)
-    
-    print(f"# weight={args.weight}; thetas_deg={thetas}; efermi={args.efermi}; "
-          f"smearing={args.smearing}; nz={args.nz}; rcut={args.rcut}")
-    print("# WF order follows win projections; centres only correct integer home-cell shifts for TB2J")
-    
-    results = []
-    
-    for theta in thetas:
-        directory = args.out / f"theta={theta}"
-        transformed = transform_prepared(prepared, theta)
-        directory.mkdir(parents=True, exist_ok=True)
+                                 d_indices, p_indices, args.bond, args.weight)
 
-        for prefix, H in zip(prefixes, transformed):
-            parser.write_hr(directory / f"{prefix}_hr.dat", R, deg, H, f"mix_dp theta={theta:g} deg weight={args.weight}")
-            for suffix in (".win", ".eig", "_centres.xyz"):
-                source = args.src / f"{prefix}{suffix}"
-                if source.exists():
-                    shutil.copy(source, directory / source.name)
-        
-        if (args.src / "POSCAR").exists():
-            shutil.copy(args.src / "POSCAR", directory / "POSCAR")
-        
-        print(f"Calculating total J and charge at theta={theta:g}", file=sys.stderr, flush=True)
-        
+    labels = parser.atom_labels(atoms)
+    atom_index = {label: i for i, label in enumerate(labels)}
+    positions = atoms.get_scaled_positions(wrap=False)[
+        [atom_index[label.split("|")[0]] for label in basis]
+    ]
+    spin_shifts = [np.rint(atoms.cell.scaled_positions(c) - positions).astype(int)
+                   for c in spin_centres]
+    print(f"# weight={args.weight}; thetas_deg={args.thetas}; efermi={args.efermi}; "
+          f"smearing={args.smearing}; nz={args.nz}; rcut={args.rcut}")
+
+    results = []
+    for theta in args.thetas:
+        models = []
+        for H, shifts in zip(hamiltonians, spin_shifts):
+            model = RotatedWannierHam(R, deg, H, X, positions, shifts, theta)
+            model.set_atoms(atoms)
+            models.append(model)
+        print(f"Calculating total J and charge at theta={theta:g}",
+              file=sys.stderr, flush=True)
         with redirect_stdout(sys.stderr):
-            result, mesh = calculate([directory / prefix for prefix in prefixes], atoms, basis, args)
-        
+            result, mesh = calculate(models, atoms, basis, args)
         results.append(result)
-    
+
     print(f"# TB2J kmesh={mesh}")
-    print_results(thetas, results, args.distance, args.tolerance)
+    print_results(args.thetas, results, args.distance, args.tolerance)
 
 
 if __name__ == "__main__":
