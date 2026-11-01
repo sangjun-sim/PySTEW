@@ -130,11 +130,11 @@ def parse_args(argv=None, description=None):
         smearing=settings["smearing"],
         weight=settings["weight"],
         prefixes=settings["prefixes"],
-        bond=settings["bond"],
+        bond=settings.get("bond"),
         elements=settings["elements"],
         rcut=settings["rcut"],
         nz=settings["nz"],
-        distance=settings["distance"],
+        distance=settings.get("distance"),
         tolerance=settings["tolerance"],
     )
     if 0.0 not in args.thetas or len(args.thetas) < 3:

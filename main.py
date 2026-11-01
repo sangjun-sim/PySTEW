@@ -5,7 +5,7 @@ Usage:
   python main.py example.json
 
 See example.json for configuration (theta in degrees, energies in eV).
-All fields are required, with no option defaults. Paths are relative to the JSON file.
+All fields except distance and bond are required. Paths are relative to the JSON file.
 Lines beginning with // are comments.
 
 SRC contains UP/DOWN .win, _hr.dat and _centres.xyz files. H_theta(k) is evaluated
@@ -13,11 +13,15 @@ directly at the TB2J k points; no transformed Hamiltonian files are written.
 OUT is the TB2J output directory. The same U(k) is applied to both spins.
 The hopping convention c=H_reference[d,p]/norm is retained from mix_dp.py.
 Weights select H_up, H_down, or (H_up+H_down)/2 BEFORE normalization.
+Mixing includes all p WFs on the nearest ligand-atom shell, grouped using
+tolerance. Optional bond overrides this with a WF-centre distance cutoff in Angstrom.
 
 q is the mean Wannier electron population of the two magnetic atoms, not an
 ionic charge. dJ/dq is np.gradient(J, q, edge_order=2) along the chosen mixing
 path, using at least three angles including zero. Only dJ/dq at theta=0 is
-printed for each pair and for the mean J and q of the selected pairs.
+printed for each pair and for the mean J and q of J1, J2 and J3. These are the
+first three magnetic-pair distance shells within rcut, grouped using tolerance.
+Optional distance overrides automatic selection with a scalar or a list.
 No orbital J, C or S is calculated. Final WF order must follow the .win projections.
 Both spins must use the same per-WF integer home-cell convention for mixing.
 No Hamiltonian k-to-R reconstruction or subsequent interpolation is performed.
@@ -37,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 import parser
 
 
-def build_generator(Hup, Hdn, R, centres, cell, d_indices, p_indices, bond, weight):
+def build_generator(Hup, Hdn, R, centres, cell, d_indices, p_indices, bond, weight, tolerance):
     reference = {"up": Hup, "down": Hdn}.get(weight)
     if weight == "average":
         reference = (Hup + Hdn) / 2.0
@@ -51,8 +55,15 @@ def build_generator(Hup, Hdn, R, centres, cell, d_indices, p_indices, bond, weig
         candidates = []
         for p in p_indices:
             for r in images:
-                if np.linalg.norm(centres[p] + r @ cell - centres[d]) < bond:
-                    candidates.append((p, r, reference[Rindex[tuple(r)], d, p]))
+                distance = np.linalg.norm(centres[p] + r @ cell - centres[d])
+                if bond is None or distance < bond:
+                    candidates.append((p, r, distance))
+        if bond is None and candidates:
+            closest = min(distance for _, _, distance in candidates)
+            candidates = [candidate for candidate in candidates
+                          if candidate[2] <= closest + tolerance]
+        candidates = [(p, r, reference[Rindex[tuple(r)], d, p])
+                      for p, r, _ in candidates]
         norm = np.sqrt(sum(abs(h) ** 2 for _, _, h in candidates))
         for p, r, h in candidates:
             c = h / norm
@@ -117,6 +128,22 @@ def print_results(thetas, results, distance, tolerance):
     reference = results[index]
     keys = sorted(reference, key=lambda key: (reference[key][0], key))
 
+    if distance is None:
+        shells = []
+        for key in keys:
+            dist = reference[key][0]
+            if not shells or dist - shells[-1][0] > tolerance:
+                if len(shells) == 3:
+                    break
+                shells.append((dist, []))
+            shells[-1][1].append(key)
+    else:
+        shells = [(target, [key for key in keys
+                            if abs(reference[key][0] - target) <= tolerance])
+                  for target in np.atleast_1d(distance)]
+    selected = {key for _, shell_keys in shells for key in shell_keys}
+    keys = [key for key in keys if key in selected]
+
     print("# theta=0; dJdq in meV/e, evaluated with np.gradient(J, q, edge_order=2)")
     print("i j Rx Ry Rz distance dJdq")
 
@@ -126,12 +153,14 @@ def print_results(thetas, results, distance, tolerance):
         derivative = np.gradient(J, q, edge_order=2)[index]
         print(i, j, *R, f"{dist:.6f}", f"{derivative:.9g}")
 
-    means = np.array([np.mean([result[key][1:] for key in keys], axis=0)
-                      for result in results])
-    derivative = np.gradient(means[:, 0], means[:, 1], edge_order=2)[index]
-    selection = f" within {distance} +/- {tolerance} Angstrom" if distance is not None else ""
-    print(f"# mean over {len(keys)} directed pairs{selection}")
-    print(f"# mean theta=0 dJdq={derivative:.9g}")
+    for shell, (target, shell_keys) in enumerate(shells, 1):
+        means = np.array([np.mean([result[key][1:] for key in shell_keys], axis=0)
+                          for result in results])
+        derivative = np.gradient(means[:, 0], means[:, 1], edge_order=2)[index]
+        selection = f" within {target} +/- {tolerance} Angstrom"
+        label = f"J{shell} " if distance is None or np.ndim(distance) else ""
+        print(f"# {label}mean over {len(shell_keys)} directed pairs{selection}")
+        print(f"# {label}mean theta=0 dJdq={derivative:.9g}")
 
 
 class RotatedWannierHam(WannierHam):
@@ -143,8 +172,8 @@ class RotatedWannierHam(WannierHam):
         self.shifts = np.asarray(shifts)
         self.theta = np.deg2rad(theta)
 
-    def gen_ham(self, k):
-        H = super().gen_ham(k)
+    def gen_ham(self, k, convention=2):
+        H = super().gen_ham(k, convention=convention)
         phase = np.exp(self.R2kfactor * (self.rotation_R @ k))
         Xk = np.einsum("r,rij->ij", phase, self.generator, optimize=True)
         U = expm(self.theta * Xk)
@@ -178,7 +207,9 @@ def calculate(models, atoms, basis, args):
         result = {}
         for key, value in exchange.exchange_Jdict.items():
             distance = exchange.distance_dict[key][1]
-            if args.distance is not None and abs(distance - args.distance) > args.tolerance:
+            if args.distance is not None and not np.any(
+                np.abs(distance - np.asarray(args.distance)) <= args.tolerance
+            ):
                 continue
             R, i, j = key
             ia, ja = exchange.iatom(i), exchange.iatom(j)
@@ -215,8 +246,16 @@ def main(argv=None):
                for centre in centres]
     d_indices = [m for m, i in enumerate(nearest) if atoms[i].symbol == args.mag]
     p_indices = [m for m, i in enumerate(nearest) if atoms[i].symbol == args.lig]
-    X = build_generator(*hamiltonians, R, centres, atoms.cell,
-                                 d_indices, p_indices, args.bond, args.weight)
+    mixing_centres = centres
+    if args.bond is None:
+        # Keep the assigned atoms in each WF's original home cell.
+        mixing_centres = np.array([
+            atoms.positions[i] + images_cart[np.argmin(
+                np.linalg.norm(centre - atoms.positions[i] - images_cart, axis=1)
+            )] for centre, i in zip(centres, nearest)
+        ])
+    X = build_generator(*hamiltonians, R, mixing_centres, atoms.cell,
+                        d_indices, p_indices, args.bond, args.weight, args.tolerance)
 
     labels = parser.atom_labels(atoms)
     atom_index = {label: i for i, label in enumerate(labels)}

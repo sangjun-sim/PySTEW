@@ -1,31 +1,21 @@
 {
   "src": "./nscf",
   "out": "basis_test",
-  "thetas": [
-    -10,
-    0,
-    10
-  ],
+  "thetas": [-5, -3, -1, 0, 1, 3, 5],
   "mag": "Ni",
   "lig": "O",
   "efermi": 14.220,
-  "kmesh": [
-    5,
-    5,
-    5
-  ],
+  "kmesh": [13, 13, 13],
   "smearing": 0.02,
   "weight": "average",
   "prefixes": [
     "wannier90.1",
     "wannier90.2"
   ],
-  "bond": 3,
   "elements": [
     "Ni"
   ],
   "rcut": 10.0,
   "nz": 100,
-  "distance": 2.997521811972016,
   "tolerance": 0.005
 }

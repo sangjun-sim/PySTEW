@@ -1,0 +1,7 @@
+&BANDS
+  prefix = 'cri3',
+  outdir = '../tmp',
+  filband = 'cri3.down.bands',
+  spin_component = 2,
+  lsym = .false.,
+/

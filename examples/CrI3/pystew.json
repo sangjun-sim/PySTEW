@@ -1,0 +1,21 @@
+{
+  "src": "./nscf",
+  "out": "basis_test",
+  "thetas": [-5, -3, -1, 0, 1, 3, 5],
+  "mag": "Cr",
+  "lig": "I",
+  "efermi": -4.951942,
+  "kmesh": [13, 13, 1],
+  "smearing": 0.02,
+  "weight": "average",
+  "prefixes": [
+    "wannier90.1",
+    "wannier90.2"
+  ],
+  "elements": [
+    "Cr"
+  ],
+  "rcut": 10.0,
+  "nz": 100,
+  "tolerance": 0.005
+}
